@@ -97,6 +97,8 @@ bool minethd::init_gpus()
 		vGpuData[i].rawIntensity = cfg.intensity;
 		vGpuData[i].workSize = cfg.w_size;
 		vGpuData[i].stridedIndex = cfg.stridedIndex;
+		vGpuData[i].memChunk = cfg.memChunk;
+		vGpuData[i].compMode = cfg.compMode;
 	}
 
 	return InitOpenCL(vGpuData.data(), n, jconf::inst()->GetPlatformIdx()) == ERR_SUCCESS;
@@ -139,7 +141,7 @@ std::vector<iBackend*>* minethd::thread_starter(uint32_t threadOffset, miner_wor
 		if(cfg.cpu_aff >= 0)
 		{
 #if defined(__APPLE__)
-			printer::inst()->print_msg(L1, "WARNING on MacOS thread affinity is only advisory.");
+			printer::inst()->print_msg(L1, "WARNING on macOS thread affinity is only advisory.");
 #endif
 
 			printer::inst()->print_msg(L1, "Starting AMD GPU thread %d, affinity: %d.", i, (int)cfg.cpu_aff);
@@ -189,8 +191,14 @@ void minethd::work_main()
 	uint64_t iCount = 0;
 	cryptonight_ctx* cpu_ctx;
 	cpu_ctx = cpu::minethd::minethd_alloc_ctx();
-	cn_hash_fun hash_fun = cpu::minethd::func_selector(::jconf::inst()->HaveHardwareAes(), true /*bNoPrefetch*/, ::jconf::inst()->IsCurrencyMonero());
+	
+	// start with root algorithm and switch later if fork version is reached
+	auto miner_algo = ::jconf::inst()->GetMiningAlgoRoot();
+	cn_hash_fun hash_fun = cpu::minethd::func_selector(::jconf::inst()->HaveHardwareAes(), true /*bNoPrefetch*/, miner_algo);
+
 	globalStates::inst().iConsumeCnt++;
+
+	uint8_t version = 0;
 
 	while (bQuit == 0)
 	{
@@ -208,12 +216,24 @@ void minethd::work_main()
 			continue;
 		}
 
+		uint8_t new_version = oWork.getVersion();
+		if(new_version != version)
+		{
+			if(new_version >= ::jconf::inst()->GetMiningForkVersion())
+			{
+				miner_algo = ::jconf::inst()->GetMiningAlgo();
+				hash_fun = cpu::minethd::func_selector(::jconf::inst()->HaveHardwareAes(), true /*bNoPrefetch*/, miner_algo);
+			}
+			version = new_version;
+		}
+
 		uint32_t h_per_round = pGpuCtx->rawIntensity;
 		size_t round_ctr = 0;
 
 		assert(sizeof(job_result::sJobID) == sizeof(pool_job::sJobID));
 		uint64_t target = oWork.iTarget;
-		XMRSetJob(pGpuCtx, oWork.bWorkBlob, oWork.iWorkSize, target);
+		
+		XMRSetJob(pGpuCtx, oWork.bWorkBlob, oWork.iWorkSize, target, miner_algo, version);
 
 		if(oWork.bNiceHash)
 			pGpuCtx->Nonce = *(uint32_t*)(oWork.bWorkBlob + 39);
@@ -229,7 +249,7 @@ void minethd::work_main()
 			cl_uint results[0x100];
 			memset(results,0,sizeof(cl_uint)*(0x100));
 
-			XMRRunJob(pGpuCtx, results);
+			XMRRunJob(pGpuCtx, results, miner_algo, version);
 
 			for(size_t i = 0; i < results[0xFF]; i++)
 			{
@@ -245,7 +265,7 @@ void minethd::work_main()
 				if ( (*((uint64_t*)(bResult + 24))) < oWork.iTarget)
 					executor::inst()->push_event(ex_event(job_result(oWork.sJobID, results[i], bResult, iThreadNo), oWork.iPoolId));
 				else
-					executor::inst()->push_event(ex_event("AMD Invalid Result", oWork.iPoolId));
+					executor::inst()->push_event(ex_event("AMD Invalid Result", pGpuCtx->deviceIdx, oWork.iPoolId));
 			}
 
 			iCount += pGpuCtx->rawIntensity;
